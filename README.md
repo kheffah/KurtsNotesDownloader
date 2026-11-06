@@ -1,4 +1,4 @@
-# Kurt's Notes — Auto-Compiled Single PDF
+# Kurt's Notes: Auto-Compiled Single PDF
 
 All of Dr. Kurt Schaberg's pathology diagnostic guides from [schaberg.faculty.ucdavis.edu](https://schaberg.faculty.ucdavis.edu/), automatically merged into a single book with a clickable Table of Contents, sidebar bookmarks, and page footers.
 
