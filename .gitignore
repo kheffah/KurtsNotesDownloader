@@ -1,0 +1,6 @@
+.kurts_notes_cache/
+Kurts_Notes_Compiled*.pdf
+latest_filename.txt
+__pycache__/
+.DS_Store
+.idea
