@@ -1,0 +1,91 @@
+name: Build Kurt's Notes Compiled PDF
+
+on:
+  workflow_dispatch: # Manual "Run workflow" button
+  schedule:
+    - cron: "0 8 * * 1" # Runs every Monday at 08:00 UTC
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache downloaded PDFs
+        uses: actions/cache@v4
+        with:
+          path: .kurts_notes_cache
+          key: kurts-notes-cache-${{ github.run_id }}
+          restore-keys: |
+            kurts-notes-cache-
+
+      - name: Install dependencies and build dated PDF
+        run: |
+          pip install curl_cffi beautifulsoup4 pymupdf
+          python compile_kurts_notes.py
+
+      - name: Publish PDF, prune old versions (keep last 2), and update links
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PDF_FILE=$(cat latest_filename.txt)
+          DOWNLOAD_URL="https://github.com/${{ github.repository }}/releases/download/latest/${PDF_FILE}"
+          echo "Publishing ${PDF_FILE} -> ${DOWNLOAD_URL}"
+
+          if gh release view latest >/dev/null 2>&1; then
+            # Upload new PDF (or overwrite in place if the date hasn't changed)
+            gh release upload latest "$PDF_FILE" --clobber
+            gh release edit latest \
+              --title "Kurt's Notes (Latest: ${PDF_FILE})" \
+              --notes "Click **${PDF_FILE}** below under Assets to download the newest compilation. Only the 2 most recent versions are kept."
+
+            # Sort attached PDFs by date in filename, keep the 2 newest, delete all older ones
+            OLD_ASSETS=$(gh release view latest --json assets -q '.assets | sort_by(.name) | reverse | .[2:][].name')
+            for asset in $OLD_ASSETS; do
+              echo "Removing older edition: $asset"
+              gh release delete-asset latest "$asset" -y
+            done
+          else
+            gh release create latest "$PDF_FILE" \
+              --title "Kurt's Notes (Latest: ${PDF_FILE})" \
+              --notes "Click **${PDF_FILE}** below under Assets to download." \
+              --latest
+          fi
+
+          # Update the 1-click Download button in README.md to the newest dated file
+          if [ -f README.md ]; then
+            sed -i -E "s|https://github\.com/[^ )\"]+/releases/download/latest/Kurts_Notes_Compiled[^ )\"]*|${DOWNLOAD_URL}|g" README.md
+          fi
+
+          # Update the permanent redirect page (docs/index.html)
+          mkdir -p docs
+          cat > docs/index.html <<EOF
+          <!DOCTYPE html>
+          <html>
+          <head>
+            <meta charset="utf-8">
+            <title>Downloading Kurt's Notes...</title>
+            <meta http-equiv="refresh" content="0; url=${DOWNLOAD_URL}">
+            <script>window.location.replace("${DOWNLOAD_URL}");</script>
+          </head>
+          <body style="font-family: system-ui, sans-serif; text-align: center; padding-top: 60px;">
+            <p>Downloading <strong>${PDF_FILE}</strong>...</p>
+            <p>If your download does not start automatically, <a href="${DOWNLOAD_URL}">click here</a>.</p>
+          </body>
+          </html>
+          EOF
+
+          # Only commit if the date/filename actually changed
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add README.md docs/index.html
+          git diff --staged --quiet || (git commit -m "Update download link to ${PDF_FILE}" && git push)
