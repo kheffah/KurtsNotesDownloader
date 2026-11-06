@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Scrapes Kurt's Notes (https://schaberg.faculty.ucdavis.edu/), downloads all
-individual pathology guide PDFs with smart caching, and compiles them into a
-single PDF with:
+individual pathology guide PDFs using Chrome TLS impersonation (curl_cffi) to
+avoid 403 WAF blocks, and compiles them into a single PDF with:
   1. A clickable front-matter Table of Contents
   2. Hierarchical PDF sidebar bookmarks
   3. A subtle footer on every body page with the section/title, clickable
@@ -11,13 +11,14 @@ single PDF with:
 
 import hashlib
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
 import fitz  # PyMuPDF
-import requests
 from bs4 import BeautifulSoup
+from curl_cffi import requests as cffi_requests
 
 BASE_URL = "https://schaberg.faculty.ucdavis.edu/"
 CACHE_DIR = Path(".kurts_notes_cache")
@@ -33,19 +34,39 @@ EXCLUDE_KEYWORDS = [
     "curriculum-vitae",
 ]
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-    )
+BROWSER_HEADERS = {
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,image/apng,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
 }
+
+
+def create_browser_session() -> cffi_requests.Session:
+    """
+    Creates a session that impersonates Chrome's TLS/JA3 and HTTP/2 fingerprint
+    so UC Davis / CampusPress WAF does not return 403 Forbidden.
+    """
+    session = cffi_requests.Session(impersonate="chrome")
+    session.headers.update(BROWSER_HEADERS)
+    return session
 
 
 def clean_text(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
 
-def truncate_to_width(text: str, max_width: float, fontname: str = "helv", fontsize: float = 8.0) -> str:
+def truncate_to_width(
+    text: str, max_width: float, fontname: str = "helv", fontsize: float = 8.0
+) -> str:
     """Truncates a string with '...' so its rendered width stays under max_width."""
     if fitz.get_text_length(text, fontname=fontname, fontsize=fontsize) <= max_width:
         return text
@@ -57,14 +78,39 @@ def truncate_to_width(text: str, max_width: float, fontname: str = "helv", fonts
     return trimmed.rstrip() + ellipsis
 
 
-def scrape_note_links(base_url: str = BASE_URL) -> list[dict]:
+def fetch_homepage_html(session: cffi_requests.Session, base_url: str = BASE_URL) -> str:
+    """
+    Fetches the homepage HTML using Chrome TLS impersonation, falling back to
+    the WordPress REST API (/wp-json/wp/v2/pages) if the main route returns 403.
+    """
+    resp = session.get(base_url, timeout=30)
+    if resp.status_code == 200 and "<a " in resp.text:
+        return resp.text
+
+    print(f"Direct homepage fetch returned HTTP {resp.status_code}; trying WordPress REST API...")
+    api_url = urljoin(base_url, "wp-json/wp/v2/pages?per_page=20")
+    api_resp = session.get(
+        api_url,
+        headers={"Accept": "application/json", "Referer": base_url},
+        timeout=30,
+    )
+    api_resp.raise_for_status()
+    pages_json = api_resp.json()
+    combined_html = "\n".join(
+        p.get("content", {}).get("rendered", "") for p in pages_json if isinstance(p, dict)
+    )
+    if not combined_html.strip():
+        resp.raise_for_status()
+    return f"<html><body><main>{combined_html}</main></body></html>"
+
+
+def scrape_note_links(session: cffi_requests.Session, base_url: str = BASE_URL) -> list[dict]:
     """
     Scrapes the homepage in document order, grouping PDF links under their
     organ-system section headings.
     """
-    resp = requests.get(base_url, headers=HEADERS, timeout=30)
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
+    html = fetch_homepage_html(session, base_url)
+    soup = BeautifulSoup(html, "html.parser")
 
     content = (
         soup.select_one(".entry-content")
@@ -120,10 +166,12 @@ def scrape_note_links(base_url: str = BASE_URL) -> list[dict]:
     return notes
 
 
-def download_pdf(url: str, cache_dir: Path = CACHE_DIR) -> Path:
+def download_pdf(
+    session: cffi_requests.Session, url: str, cache_dir: Path = CACHE_DIR
+) -> Path:
     """
-    Downloads a PDF into cache_dir. Hashing the full URL keeps cached files
-    current whenever a note is updated under a new path or filename.
+    Downloads a PDF into cache_dir using the active browser session and a
+    Referer header so hotlink protection / WAF rules do not block the download.
     """
     cache_dir.mkdir(parents=True, exist_ok=True)
     url_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()[:12]
@@ -134,13 +182,25 @@ def download_pdf(url: str, cache_dir: Path = CACHE_DIR) -> Path:
         return local_path
 
     print(f"Downloading: {url}")
-    resp = requests.get(url, headers=HEADERS, timeout=60)
+    pdf_headers = {
+        "Accept": "application/pdf,*/*;q=0.8",
+        "Referer": BASE_URL,
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
+    }
+    resp = session.get(url, headers=pdf_headers, timeout=60)
     resp.raise_for_status()
     local_path.write_bytes(resp.content)
+
+    # Brief pause between fresh downloads to avoid triggering WAF rate limits
+    time.sleep(0.3)
     return local_path
 
 
-def add_body_footers(final_doc: fitz.Document, toc_page_count: int, body_page_meta: list[tuple[str, str]]):
+def add_body_footers(
+    final_doc: fitz.Document, toc_page_count: int, body_page_meta: list[tuple[str, str]]
+):
     """
     Stamps a subtle footer on every body page with:
       - Left:   Section Name - Note Title
@@ -157,8 +217,6 @@ def add_body_footers(final_doc: fitz.Document, toc_page_count: int, body_page_me
         page_idx = toc_page_count + body_idx
         page = final_doc[page_idx]
 
-        # Isolate existing page graphics state so footer coordinates are never
-        # distorted by transformation matrices inside the source PDF
         page.wrap_contents()
 
         rect = page.rect
@@ -166,7 +224,6 @@ def add_body_footers(final_doc: fitz.Document, toc_page_count: int, body_page_me
         baseline_y = rect.y1 - 7.5
         center_x = (rect.x0 + rect.x1) / 2.0
 
-        # Subtle white backing strip + hairline divider at bottom of page
         bg_rect = fitz.Rect(rect.x0, footer_top, rect.x1, rect.y1)
         page.draw_rect(bg_rect, color=None, fill=(1.0, 1.0, 1.0))
         page.draw_line(
@@ -176,12 +233,14 @@ def add_body_footers(final_doc: fitz.Document, toc_page_count: int, body_page_me
             width=0.4,
         )
 
-        # 1. Left: Section name & note title (truncated before reaching center link)
+        # 1. Left: Section name & note title
         left_x = rect.x0 + margin_x
         back_start_x = center_x - (back_width / 2.0)
         max_left_width = max(60.0, back_start_x - left_x - 14.0)
         raw_section_label = f"{category} - {title}"
-        section_label = truncate_to_width(raw_section_label, max_left_width, fontname="helv", fontsize=font_size)
+        section_label = truncate_to_width(
+            raw_section_label, max_left_width, fontname="helv", fontsize=font_size
+        )
 
         page.insert_text(
             (left_x, baseline_y),
@@ -209,7 +268,7 @@ def add_body_footers(final_doc: fitz.Document, toc_page_count: int, body_page_me
             {
                 "kind": fitz.LINK_GOTO,
                 "from": link_rect,
-                "page": 0,  # First page of the Table of Contents
+                "page": 0,
             }
         )
 
@@ -227,28 +286,29 @@ def add_body_footers(final_doc: fitz.Document, toc_page_count: int, body_page_me
         )
 
 
-def build_compiled_pdf(notes: list[dict], output_path: Path = OUTPUT_PDF):
+def build_compiled_pdf(
+    session: cffi_requests.Session, notes: list[dict], output_path: Path = OUTPUT_PDF
+):
     """
     Merges all downloaded PDFs, constructs a clickable front-matter Table of
     Contents, stamps footers on every body page, and builds the PDF bookmark tree.
     """
     body_doc = fitz.open()
     url_to_page_start: dict[str, int] = {}
-    toc_entries = []  # (category, title, body_start_page_0_idx)
-    body_page_meta: list[tuple[str, str]] = []  # (category, title) per body page
+    toc_entries = []
+    body_page_meta: list[tuple[str, str]] = []
 
     for item in notes:
         url = item["url"]
         category = item["category"]
         title = item["title"]
 
-        # Point cross-listed notes to their first appearance instead of duplicating pages
         if url in url_to_page_start:
             toc_entries.append((category, f"{title} (cross-listed)", url_to_page_start[url]))
             continue
 
         try:
-            pdf_path = download_pdf(url)
+            pdf_path = download_pdf(session, url)
             with fitz.open(pdf_path) as src_pdf:
                 num_pages = src_pdf.page_count
                 if num_pages == 0:
@@ -262,7 +322,6 @@ def build_compiled_pdf(notes: list[dict], output_path: Path = OUTPUT_PDF):
         except Exception as exc:
             print(f"Warning: Failed to process '{title}' ({url}): {exc}")
 
-    # Calculate how many pages the front-matter TOC requires
     toc_lines = []
     last_cat = None
     for cat, title, start_page in toc_entries:
@@ -277,13 +336,14 @@ def build_compiled_pdf(notes: list[dict], output_path: Path = OUTPUT_PDF):
         toc_page_count = 1
     else:
         remaining = len(toc_lines) - lines_per_first_page
-        toc_page_count = 1 + (remaining + lines_per_subsequent_page - 1) // lines_per_subsequent_page
+        toc_page_count = (
+            1 + (remaining + lines_per_subsequent_page - 1) // lines_per_subsequent_page
+        )
 
-    # Render TOC pages into final_doc
     final_doc = fitz.open()
-    page_width, page_height = 612, 792  # US Letter (8.5 x 11 in)
+    page_width, page_height = 612, 792
     margin_x = 50
-    pending_links = []  # (toc_page_idx, fitz.Rect, target_final_page_idx)
+    pending_links = []
 
     line_idx = 0
     for page_i in range(toc_page_count):
@@ -392,11 +452,9 @@ def build_compiled_pdf(notes: list[dict], output_path: Path = OUTPUT_PDF):
             line_idx += 1
             lines_drawn += 1
 
-    # Append all note pages after the TOC pages
     final_doc.insert_pdf(body_doc)
     body_doc.close()
 
-    # Activate clickable links on the TOC pages
     for toc_page_idx, rect, target_page_0 in pending_links:
         final_doc[toc_page_idx].insert_link(
             {
@@ -406,10 +464,8 @@ def build_compiled_pdf(notes: list[dict], output_path: Path = OUTPUT_PDF):
             }
         )
 
-    # Stamp the section footer, 'Back to TOC' link, and global page numbers on all body pages
     add_body_footers(final_doc, toc_page_count, body_page_meta)
 
-    # Build the PDF Sidebar Outline (Bookmarks)
     pdf_outline = [[1, "Table of Contents", 1]]
     current_cat = None
     for cat, title, body_start in toc_entries:
@@ -421,12 +477,15 @@ def build_compiled_pdf(notes: list[dict], output_path: Path = OUTPUT_PDF):
 
     final_doc.set_toc(pdf_outline)
     final_doc.save(output_path, garbage=4, deflate=True)
-    print(f"\nSuccess! Saved {final_doc.page_count}-page compiled book to: {output_path.resolve()}")
+    print(
+        f"\nSuccess! Saved {final_doc.page_count}-page compiled book to: {output_path.resolve()}"
+    )
     final_doc.close()
 
 
 if __name__ == "__main__":
     print(f"Fetching index from {BASE_URL} ...")
-    scraped_notes = scrape_note_links()
+    browser_session = create_browser_session()
+    scraped_notes = scrape_note_links(browser_session)
     print(f"Found {len(scraped_notes)} note links across categories.")
-    build_compiled_pdf(scraped_notes)
+    build_compiled_pdf(browser_session, scraped_notes)
