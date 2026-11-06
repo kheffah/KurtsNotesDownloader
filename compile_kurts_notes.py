@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
 Scrapes Kurt's Notes (https://schaberg.faculty.ucdavis.edu/), downloads all
-individual pathology guide PDFs using Chrome TLS impersonation (curl_cffi) to
-avoid 403 WAF blocks, and compiles them into a single PDF with:
+individual pathology guide PDFs using Chrome TLS impersonation (curl_cffi),
+prunes outdated cached files, determines the most recent Last-Modified date
+across all notes, and compiles them into Kurts_Notes_Compiled_YYYY-MM-DD.pdf
+with:
   1. A clickable front-matter Table of Contents
   2. Hierarchical PDF sidebar bookmarks
   3. A subtle footer on every body page with the section/title, clickable
@@ -10,9 +12,11 @@ avoid 403 WAF blocks, and compiles them into a single PDF with:
 """
 
 import hashlib
+import os
 import re
 import time
 from datetime import datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
@@ -22,7 +26,8 @@ from curl_cffi import requests as cffi_requests
 
 BASE_URL = "https://schaberg.faculty.ucdavis.edu/"
 CACHE_DIR = Path(".kurts_notes_cache")
-OUTPUT_PDF = Path("Kurts_Notes_Compiled.pdf")
+FILENAME_RECORD = Path("latest_filename.txt")
+MAX_LOCAL_EDITIONS = 2
 
 # Exclude pre-compiled bundles or non-note PDFs if encountered
 EXCLUDE_KEYWORDS = [
@@ -170,8 +175,8 @@ def download_pdf(
     session: cffi_requests.Session, url: str, cache_dir: Path = CACHE_DIR
 ) -> Path:
     """
-    Downloads a PDF into cache_dir using the active browser session and a
-    Referer header so hotlink protection / WAF rules do not block the download.
+    Downloads a PDF into cache_dir and preserves the server's Last-Modified
+    timestamp on the cached file so we can determine the latest update date.
     """
     cache_dir.mkdir(parents=True, exist_ok=True)
     url_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()[:12]
@@ -193,9 +198,36 @@ def download_pdf(
     resp.raise_for_status()
     local_path.write_bytes(resp.content)
 
+    # Preserve the server's Last-Modified date on the cached file
+    last_mod = resp.headers.get("Last-Modified")
+    if last_mod:
+        try:
+            dt = parsedate_to_datetime(last_mod)
+            ts = dt.timestamp()
+            os.utime(local_path, (ts, ts))
+        except Exception:
+            pass
+
     # Brief pause between fresh downloads to avoid triggering WAF rate limits
     time.sleep(0.3)
     return local_path
+
+
+def prune_cache_and_old_builds(used_cache_files: set[Path], max_editions: int = MAX_LOCAL_EDITIONS):
+    """
+    1. Deletes any cached single-chapter PDFs that are no longer linked on Kurt's site.
+    2. Keeps only the `max_editions` newest compiled PDFs in the working directory.
+    """
+    if used_cache_files and CACHE_DIR.exists():
+        for cached_file in CACHE_DIR.glob("*.pdf"):
+            if cached_file.resolve() not in used_cache_files:
+                print(f"Pruning outdated cache file: {cached_file.name}")
+                cached_file.unlink(missing_ok=True)
+
+    compiled_files = sorted(Path(".").glob("Kurts_Notes_Compiled_*.pdf"), reverse=True)
+    for old_pdf in compiled_files[max_editions:]:
+        print(f"Removing older local compiled edition: {old_pdf.name}")
+        old_pdf.unlink(missing_ok=True)
 
 
 def add_body_footers(
@@ -217,6 +249,8 @@ def add_body_footers(
         page_idx = toc_page_count + body_idx
         page = final_doc[page_idx]
 
+        # Isolate existing page graphics state so footer coordinates are never
+        # distorted by transformation matrices inside the source PDF
         page.wrap_contents()
 
         rect = page.rect
@@ -286,17 +320,18 @@ def add_body_footers(
         )
 
 
-def build_compiled_pdf(
-    session: cffi_requests.Session, notes: list[dict], output_path: Path = OUTPUT_PDF
-):
+def build_compiled_pdf(session: cffi_requests.Session, notes: list[dict]) -> Path:
     """
     Merges all downloaded PDFs, constructs a clickable front-matter Table of
-    Contents, stamps footers on every body page, and builds the PDF bookmark tree.
+    Contents, stamps footers on every body page, builds the PDF bookmark tree,
+    and prunes obsolete cache files.
     """
     body_doc = fitz.open()
     url_to_page_start: dict[str, int] = {}
     toc_entries = []
     body_page_meta: list[tuple[str, str]] = []
+    used_cache_files: set[Path] = set()
+    latest_mtime = 0.0
 
     for item in notes:
         url = item["url"]
@@ -309,6 +344,11 @@ def build_compiled_pdf(
 
         try:
             pdf_path = download_pdf(session, url)
+            used_cache_files.add(pdf_path.resolve())
+            mtime = pdf_path.stat().st_mtime
+            if mtime > latest_mtime:
+                latest_mtime = mtime
+
             with fitz.open(pdf_path) as src_pdf:
                 num_pages = src_pdf.page_count
                 if num_pages == 0:
@@ -321,6 +361,15 @@ def build_compiled_pdf(
                     body_page_meta.append((category, title))
         except Exception as exc:
             print(f"Warning: Failed to process '{title}' ({url}): {exc}")
+
+    if latest_mtime > 0:
+        last_update_dt = datetime.fromtimestamp(latest_mtime)
+    else:
+        last_update_dt = datetime.now()
+
+    date_slug = last_update_dt.strftime("%Y-%m-%d")
+    human_date = last_update_dt.strftime("%B %d, %Y")
+    output_path = Path(f"Kurts_Notes_Compiled_{date_slug}.pdf")
 
     toc_lines = []
     last_cat = None
@@ -359,10 +408,9 @@ def build_compiled_pdf(
                 color=(0.07, 0.22, 0.42),
             )
             y += 22
-            compiled_date = datetime.now().strftime("%B %d, %Y")
             page.insert_text(
                 (margin_x, y),
-                f"Source: {BASE_URL}  |  Compiled: {compiled_date}",
+                f"Source: {BASE_URL}  |  Last Note Update: {human_date}",
                 fontsize=9.5,
                 fontname="helv",
                 color=(0.35, 0.35, 0.35),
@@ -477,10 +525,16 @@ def build_compiled_pdf(
 
     final_doc.set_toc(pdf_outline)
     final_doc.save(output_path, garbage=4, deflate=True)
+    FILENAME_RECORD.write_text(output_path.name, encoding="utf-8")
     print(
         f"\nSuccess! Saved {final_doc.page_count}-page compiled book to: {output_path.resolve()}"
     )
     final_doc.close()
+
+    # Prune replaced single-chapter cache files and keep at most 2 local compiled PDFs
+    prune_cache_and_old_builds(used_cache_files)
+
+    return output_path
 
 
 if __name__ == "__main__":
